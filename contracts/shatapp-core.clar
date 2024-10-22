@@ -1,21 +1,52 @@
 ;; Title: ShatApp Core Contract
-;; Version: 1.0.0
-;; Description: Core functionality for ShatApp decentralized chat application
+;; Version: 1.1.0
+;; Description: Enhanced core functionality for ShatApp decentralized chat application
 
 ;; Error codes
 (define-constant ERR_NOT_FOUND (err u100))
 (define-constant ERR_ALREADY_EXISTS (err u101))
 (define-constant ERR_UNAUTHORIZED (err u102))
 (define-constant ERR_INVALID_INPUT (err u103))
+(define-constant ERR_BLOCKED (err u104))
+(define-constant ERR_DEACTIVATED (err u105))
+
+;; Constants for user status
+(define-constant STATUS_DEACTIVATED u0)
+(define-constant STATUS_ACTIVE u1)
+(define-constant STATUS_SUSPENDED u2)
+
+;; Constants for friendship status
+(define-constant FRIENDSHIP_PENDING u0)
+(define-constant FRIENDSHIP_ACTIVE u1)
+(define-constant FRIENDSHIP_BLOCKED u2)
 
 ;; Data structures
 (define-map Users 
     principal 
     {
         name: (string-ascii 64),
-        status: uint,  ;; 0: inactive, 1: active
+        status: uint,  ;; 0: deactivated, 1: active, 2: suspended
         timestamp: uint,
-        metadata: (optional (string-utf8 256))  ;; For additional user data
+        metadata: (optional (string-utf8 256)),
+        deactivation-time: (optional uint)
+    }
+)
+
+(define-map UserPrivacy
+    principal
+    {
+        friend-list-visible: bool,
+        status-visible: bool,
+        metadata-visible: bool,
+        last-updated: uint
+    }
+)
+
+(define-map BlockedUsers
+    {blocker: principal, blocked: principal}
+    {
+        timestamp: uint,
+        reason: (optional (string-ascii 64))
     }
 )
 
@@ -32,21 +63,60 @@
     {user1: principal, user2: principal}
     {
         status: uint,  ;; 0: pending, 1: active, 2: blocked
-        timestamp: uint
+        timestamp: uint,
+        last-interaction: uint
     }
+)
+
+;; Private functions
+(define-private (check-active-user (user principal))
+    (match (map-get? Users user)
+        user-data (and 
+            (is-eq (get status user-data) STATUS_ACTIVE)
+            (is-none (get deactivation-time user-data))
+        )
+        false
+    )
+)
+
+(define-private (check-blocked (user1 principal) (user2 principal))
+    (is-some (map-get? BlockedUsers {blocker: user1, blocked: user2}))
 )
 
 ;; Read-only functions
 (define-read-only (get-user (user principal))
-    (ok (map-get? Users user))
+    (let
+        (
+            (caller tx-sender)
+            (user-data (map-get? Users user))
+            (privacy (default-to 
+                {friend-list-visible: true, status-visible: true, metadata-visible: true, last-updated: u0}
+                (map-get? UserPrivacy user)
+            ))
+        )
+        (if (or 
+            (is-eq caller user)
+            (and
+                (get status-visible privacy)
+                (not (check-blocked user caller))
+            ))
+            (ok user-data)
+            (err ERR_UNAUTHORIZED)
+        )
+    )
 )
 
 (define-read-only (get-friendship-status (user1 principal) (user2 principal))
-    (ok (map-get? Friendships {user1: user1, user2: user2}))
-)
-
-(define-read-only (get-user-batch-info (user principal))
-    (ok (map-get? UserBatches user))
+    (let
+        (
+            (friendship1 (map-get? Friendships {user1: user1, user2: user2}))
+            (friendship2 (map-get? Friendships {user1: user2, user2: user1}))
+        )
+        (ok {
+            forward: friendship1,
+            reverse: friendship2
+        })
+    )
 )
 
 ;; Public functions
@@ -59,14 +129,25 @@
         (asserts! (is-none existing-user) ERR_ALREADY_EXISTS)
         (asserts! (> (len name) u0) ERR_INVALID_INPUT)
         
-        ;; Direct map-set without try! since it doesn't return a response
         (map-set Users 
             caller
             {
                 name: name,
-                status: u1,
+                status: STATUS_ACTIVE,
                 timestamp: (unwrap-panic (get-block-info? time u0)),
-                metadata: metadata
+                metadata: metadata,
+                deactivation-time: none
+            }
+        )
+        
+        ;; Set default privacy settings
+        (map-set UserPrivacy
+            caller
+            {
+                friend-list-visible: true,
+                status-visible: true,
+                metadata-visible: true,
+                last-updated: (unwrap-panic (get-block-info? time u0))
             }
         )
         
@@ -76,88 +157,145 @@
             {
                 message-counter: u0,
                 last-batch-timestamp: (unwrap-panic (get-block-info? time u0)),
-                batch-size: u50  ;; Default batch size
+                batch-size: u50
             }
         )
         
+        (print {event: "user-registered", user: caller})
         (ok true)
     )
 )
 
-(define-public (update-user-status (new-status uint))
+(define-public (deactivate-account)
     (let
         (
             (caller tx-sender)
             (user (map-get? Users caller))
         )
         (asserts! (is-some user) ERR_NOT_FOUND)
-        (asserts! (<= new-status u2) ERR_INVALID_INPUT)
+        (asserts! (is-eq (get status (unwrap-panic user)) STATUS_ACTIVE) ERR_UNAUTHORIZED)
         
         (map-set Users 
             caller
-            (merge (unwrap-panic user) {status: new-status})
-        )
-        
-        (ok true)
-    )
-)
-
-(define-public (update-user-metadata (new-metadata (string-utf8 256)))
-    (let
-        (
-            (caller tx-sender)
-            (user (map-get? Users caller))
-        )
-        (asserts! (is-some user) ERR_NOT_FOUND)
-        
-        (map-set Users 
-            caller
-            (merge (unwrap-panic user) {metadata: (some new-metadata)})
-        )
-        
-        (ok true)
-    )
-)
-
-(define-public (init-friendship (friend principal))
-    (let
-        (
-            (caller tx-sender)
-            (friendship-data {
-                status: u0,  ;; pending
-                timestamp: (unwrap-panic (get-block-info? time u0))
+            (merge (unwrap-panic user) {
+                status: STATUS_DEACTIVATED,
+                deactivation-time: (some (unwrap-panic (get-block-info? time u0)))
             })
         )
-        (asserts! (not (is-eq caller friend)) ERR_INVALID_INPUT)
-        (asserts! (is-some (map-get? Users friend)) ERR_NOT_FOUND)
         
-        ;; Check if friendship already exists
-        (asserts! (is-none (map-get? Friendships {user1: caller, user2: friend})) ERR_ALREADY_EXISTS)
-        (asserts! (is-none (map-get? Friendships {user1: friend, user2: caller})) ERR_ALREADY_EXISTS)
-        
-        (map-set Friendships 
-            {user1: caller, user2: friend}
-            friendship-data
-        )
-        
+        (print {event: "account-deactivated", user: caller})
         (ok true)
     )
 )
 
-(define-public (accept-friendship (friend principal))
+(define-public (reactivate-account)
     (let
         (
             (caller tx-sender)
-            (friendship (map-get? Friendships {user1: friend, user2: caller}))
+            (user (map-get? Users caller))
         )
-        (asserts! (is-some friendship) ERR_NOT_FOUND)
-        (asserts! (is-eq (get status (unwrap-panic friendship)) u0) ERR_INVALID_INPUT)
+        (asserts! (is-some user) ERR_NOT_FOUND)
+        (asserts! (is-eq (get status (unwrap-panic user)) STATUS_DEACTIVATED) ERR_UNAUTHORIZED)
         
-        (map-set Friendships 
-            {user1: friend, user2: caller}
-            (merge (unwrap-panic friendship) {status: u1})
+        (map-set Users 
+            caller
+            (merge (unwrap-panic user) {
+                status: STATUS_ACTIVE,
+                deactivation-time: none
+            })
         )
         
+        (print {event: "account-reactivated", user: caller})
+        (ok true)
+    )
+)
+
+(define-public (update-privacy-settings (friend-list-visible bool) (status-visible bool) (metadata-visible bool))
+    (let
+        (
+            (caller tx-sender)
+            (user (map-get? Users caller))
+        )
+        (asserts! (is-some user) ERR_NOT_FOUND)
+        (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        
+        (map-set UserPrivacy
+            caller
+            {
+                friend-list-visible: friend-list-visible,
+                status-visible: status-visible,
+                metadata-visible: metadata-visible,
+                last-updated: (unwrap-panic (get-block-info? time u0))
+            }
+        )
+        
+        (print {
+            event: "privacy-updated",
+            user: caller,
+            settings: {
+                friend-list-visible: friend-list-visible,
+                status-visible: status-visible,
+                metadata-visible: metadata-visible
+            }
+        })
+        (ok true)
+    )
+)
+
+(define-public (block-user (user principal))
+    (let
+        (
+            (caller tx-sender)
+        )
+        (asserts! (not (is-eq caller user)) ERR_INVALID_INPUT)
+        (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        
+        ;; Remove any existing friendship
+        (map-delete Friendships {user1: caller, user2: user})
+        (map-delete Friendships {user1: user, user2: caller})
+        
+        ;; Add to blocked users
+        (map-set BlockedUsers
+            {blocker: caller, blocked: user}
+            {
+                timestamp: (unwrap-panic (get-block-info? time u0)),
+                reason: none
+            }
+        )
+        
+        (print {event: "user-blocked", blocker: caller, blocked: user})
+        (ok true)
+    )
+)
+
+(define-public (unblock-user (user principal))
+    (let
+        (
+            (caller tx-sender)
+            (block-data (map-get? BlockedUsers {blocker: caller, blocked: user}))
+        )
+        (asserts! (is-some block-data) ERR_NOT_FOUND)
+        
+        (map-delete BlockedUsers {blocker: caller, blocked: user})
+        
+        (print {event: "user-unblocked", blocker: caller, blocked: user})
+        (ok true)
+    )
+)
+
+(define-public (cancel-friendship (friend principal))
+    (let
+        (
+            (caller tx-sender)
+        )
+        (asserts! (not (is-eq caller friend)) ERR_INVALID_INPUT)
+        (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        
+        ;; Remove friendship in both directions
+        (map-delete Friendships {user1: caller, user2: friend})
+        (map-delete Friendships {user1: friend, user2: caller})
+        
+        (print {event: "friendship-cancelled", user1: caller, user2: friend})
         (ok true)
     )
 )
