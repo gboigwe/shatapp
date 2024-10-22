@@ -1,6 +1,6 @@
 ;; Title: ShatApp Core Contract
-;; Version: 1.1.0
-;; Description: Enhanced core functionality for ShatApp decentralized chat application
+;; Version: 1.2.0
+;; Description: Advanced core functionality for ShatApp decentralized chat application
 
 ;; Error codes
 (define-constant ERR_NOT_FOUND (err u100))
@@ -9,26 +9,41 @@
 (define-constant ERR_INVALID_INPUT (err u103))
 (define-constant ERR_BLOCKED (err u104))
 (define-constant ERR_DEACTIVATED (err u105))
+(define-constant ERR_RATE_LIMITED (err u106))
+(define-constant ERR_BATCH_FULL (err u107))
+(define-constant ERR_BATCH_EXPIRED (err u108))
 
-;; Constants for user status
+;; Constants
 (define-constant STATUS_DEACTIVATED u0)
 (define-constant STATUS_ACTIVE u1)
 (define-constant STATUS_SUSPENDED u2)
 
-;; Constants for friendship status
 (define-constant FRIENDSHIP_PENDING u0)
 (define-constant FRIENDSHIP_ACTIVE u1)
 (define-constant FRIENDSHIP_BLOCKED u2)
+
+;; Rate limiting constants
+(define-constant MAX_ACTIONS_PER_DAY u100)
+(define-constant MAX_FRIEND_REQUESTS_PER_DAY u20)
+(define-constant MAX_STATUS_UPDATES_PER_DAY u24)
+(define-constant RATE_LIMIT_RESET_PERIOD u86400) ;; 24 hours in seconds
+
+;; Batch processing constants
+(define-constant MIN_BATCH_SIZE u10)
+(define-constant MAX_BATCH_SIZE u100)
+(define-constant BATCH_EXPIRY_PERIOD u3600) ;; 1 hour in seconds
 
 ;; Data structures
 (define-map Users 
     principal 
     {
         name: (string-ascii 64),
-        status: uint,  ;; 0: deactivated, 1: active, 2: suspended
+        status: uint,
         timestamp: uint,
         metadata: (optional (string-utf8 256)),
-        deactivation-time: (optional uint)
+        deactivation-time: (optional uint),
+        encryption-key: (optional (buff 32)),
+        profile-image: (optional (string-utf8 256))
     }
 )
 
@@ -38,15 +53,20 @@
         friend-list-visible: bool,
         status-visible: bool,
         metadata-visible: bool,
+        last-seen-visible: bool,
+        profile-image-visible: bool,
+        encryption-enabled: bool,
         last-updated: uint
     }
 )
 
-(define-map BlockedUsers
-    {blocker: principal, blocked: principal}
+(define-map RateLimits
+    principal
     {
-        timestamp: uint,
-        reason: (optional (string-ascii 64))
+        daily-actions: uint,
+        friend-requests: uint,
+        status-updates: uint,
+        last-reset: uint
     }
 )
 
@@ -55,169 +75,159 @@
     {
         message-counter: uint,
         last-batch-timestamp: uint,
-        batch-size: uint
+        batch-size: uint,
+        current-batch-items: uint,
+        total-batches: uint
     }
 )
 
-(define-map Friendships
-    {user1: principal, user2: principal}
+(define-map UserActivity
+    principal
     {
-        status: uint,  ;; 0: pending, 1: active, 2: blocked
-        timestamp: uint,
-        last-interaction: uint
+        last-seen: uint,
+        login-count: uint,
+        total-actions: uint,
+        last-action: uint
     }
 )
 
 ;; Private functions
-(define-private (check-active-user (user principal))
-    (match (map-get? Users user)
-        user-data (and 
-            (is-eq (get status user-data) STATUS_ACTIVE)
-            (is-none (get deactivation-time user-data))
-        )
-        false
-    )
-)
-
-(define-private (check-blocked (user1 principal) (user2 principal))
-    (is-some (map-get? BlockedUsers {blocker: user1, blocked: user2}))
-)
-
-;; Read-only functions
-(define-read-only (get-user (user principal))
+(define-private (check-rate-limit (user principal) (action-type uint))
     (let
         (
-            (caller tx-sender)
-            (user-data (map-get? Users user))
-            (privacy (default-to 
-                {friend-list-visible: true, status-visible: true, metadata-visible: true, last-updated: u0}
-                (map-get? UserPrivacy user)
+            (rate-data (default-to 
+                {
+                    daily-actions: u0,
+                    friend-requests: u0,
+                    status-updates: u0,
+                    last-reset: (unwrap-panic (get-block-info? time u0))
+                }
+                (map-get? RateLimits user)
             ))
+            (current-time (unwrap-panic (get-block-info? time u0)))
+            (should-reset (> (- current-time (get last-reset rate-data)) RATE_LIMIT_RESET_PERIOD))
         )
-        (if (or 
-            (is-eq caller user)
+        (if should-reset
+            ;; Reset counters if period expired
+            (begin
+                (map-set RateLimits user
+                    {
+                        daily-actions: u1,
+                        friend-requests: (if (is-eq action-type u1) u1 u0),
+                        status-updates: (if (is-eq action-type u2) u1 u0),
+                        last-reset: current-time
+                    }
+                )
+                true
+            )
+            ;; Check limits
             (and
-                (get status-visible privacy)
-                (not (check-blocked user caller))
+                (< (get daily-actions rate-data) MAX_ACTIONS_PER_DAY)
+                (or 
+                    (not (is-eq action-type u1))
+                    (< (get friend-requests rate-data) MAX_FRIEND_REQUESTS_PER_DAY)
+                )
+                (or
+                    (not (is-eq action-type u2))
+                    (< (get status-updates rate-data) MAX_STATUS_UPDATES_PER_DAY)
+                )
+            )
+        )
+    )
+)
+
+(define-private (update-rate-limit (user principal) (action-type uint))
+    (let
+        (
+            (rate-data (unwrap-panic (map-get? RateLimits user)))
+        )
+        (map-set RateLimits user
+            (merge rate-data {
+                daily-actions: (+ (get daily-actions rate-data) u1),
+                friend-requests: (+ (get friend-requests rate-data) (if (is-eq action-type u1) u1 u0)),
+                status-updates: (+ (get status-updates rate-data) (if (is-eq action-type u2) u1 u0))
+            })
+        )
+    )
+)
+
+(define-private (update-user-activity (user principal))
+    (let
+        (
+            (current-time (unwrap-panic (get-block-info? time u0)))
+            (activity (default-to
+                {
+                    last-seen: current-time,
+                    login-count: u0,
+                    total-actions: u0,
+                    last-action: current-time
+                }
+                (map-get? UserActivity user)
             ))
-            (ok user-data)
-            (err ERR_UNAUTHORIZED)
         )
-    )
-)
-
-(define-read-only (get-friendship-status (user1 principal) (user2 principal))
-    (let
-        (
-            (friendship1 (map-get? Friendships {user1: user1, user2: user2}))
-            (friendship2 (map-get? Friendships {user1: user2, user2: user1}))
-        )
-        (ok {
-            forward: friendship1,
-            reverse: friendship2
-        })
-    )
-)
-
-;; Public functions
-(define-public (register-user (name (string-ascii 64)) (metadata (optional (string-utf8 256))))
-    (let
-        (
-            (caller tx-sender)
-            (existing-user (map-get? Users caller))
-        )
-        (asserts! (is-none existing-user) ERR_ALREADY_EXISTS)
-        (asserts! (> (len name) u0) ERR_INVALID_INPUT)
-        
-        (map-set Users 
-            caller
-            {
-                name: name,
-                status: STATUS_ACTIVE,
-                timestamp: (unwrap-panic (get-block-info? time u0)),
-                metadata: metadata,
-                deactivation-time: none
-            }
-        )
-        
-        ;; Set default privacy settings
-        (map-set UserPrivacy
-            caller
-            {
-                friend-list-visible: true,
-                status-visible: true,
-                metadata-visible: true,
-                last-updated: (unwrap-panic (get-block-info? time u0))
-            }
-        )
-        
-        ;; Initialize batch tracking
-        (map-set UserBatches
-            caller
-            {
-                message-counter: u0,
-                last-batch-timestamp: (unwrap-panic (get-block-info? time u0)),
-                batch-size: u50
-            }
-        )
-        
-        (print {event: "user-registered", user: caller})
-        (ok true)
-    )
-)
-
-(define-public (deactivate-account)
-    (let
-        (
-            (caller tx-sender)
-            (user (map-get? Users caller))
-        )
-        (asserts! (is-some user) ERR_NOT_FOUND)
-        (asserts! (is-eq (get status (unwrap-panic user)) STATUS_ACTIVE) ERR_UNAUTHORIZED)
-        
-        (map-set Users 
-            caller
-            (merge (unwrap-panic user) {
-                status: STATUS_DEACTIVATED,
-                deactivation-time: (some (unwrap-panic (get-block-info? time u0)))
+        (map-set UserActivity user
+            (merge activity {
+                last-seen: current-time,
+                total-actions: (+ (get total-actions activity) u1),
+                last-action: current-time
             })
         )
-        
-        (print {event: "account-deactivated", user: caller})
-        (ok true)
     )
 )
 
-(define-public (reactivate-account)
+;; Batch management functions
+(define-public (optimize-batch-size (user principal))
     (let
         (
-            (caller tx-sender)
-            (user (map-get? Users caller))
+            (batch-data (unwrap-panic (map-get? UserBatches user)))
+            (current-time (unwrap-panic (get-block-info? time u0)))
+            (time-since-last-batch (- current-time (get last-batch-timestamp batch-data)))
+            (current-batch-size (get batch-size batch-data))
+            (items-in-current-batch (get current-batch-items batch-data))
         )
-        (asserts! (is-some user) ERR_NOT_FOUND)
-        (asserts! (is-eq (get status (unwrap-panic user)) STATUS_DEACTIVATED) ERR_UNAUTHORIZED)
-        
-        (map-set Users 
-            caller
-            (merge (unwrap-panic user) {
-                status: STATUS_ACTIVE,
-                deactivation-time: none
-            })
+        (if (> time-since-last-batch BATCH_EXPIRY_PERIOD)
+            ;; Batch expired, reset and adjust size
+            (begin
+                (map-set UserBatches user
+                    (merge batch-data {
+                        batch-size: (max MIN_BATCH_SIZE (/ current-batch-size u2)),
+                        current-batch-items: u0,
+                        last-batch-timestamp: current-time
+                    })
+                )
+                (ok true)
+            )
+            ;; Adjust based on usage
+            (begin
+                (map-set UserBatches user
+                    (merge batch-data {
+                        batch-size: (min MAX_BATCH_SIZE 
+                            (if (>= items-in-current-batch (/ current-batch-size u2))
+                                (* current-batch-size u2)
+                                current-batch-size
+                            ))
+                    })
+                )
+                (ok true)
+            )
         )
-        
-        (print {event: "account-reactivated", user: caller})
-        (ok true)
     )
 )
 
-(define-public (update-privacy-settings (friend-list-visible bool) (status-visible bool) (metadata-visible bool))
+;; Enhanced privacy functions
+(define-public (update-advanced-privacy-settings
+    (friend-list-visible bool)
+    (status-visible bool)
+    (metadata-visible bool)
+    (last-seen-visible bool)
+    (profile-image-visible bool)
+    (encryption-enabled bool))
     (let
         (
             (caller tx-sender)
-            (user (map-get? Users caller))
         )
-        (asserts! (is-some user) ERR_NOT_FOUND)
         (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        (asserts! (check-rate-limit caller u2) ERR_RATE_LIMITED)
         
         (map-set UserPrivacy
             caller
@@ -225,82 +235,113 @@
                 friend-list-visible: friend-list-visible,
                 status-visible: status-visible,
                 metadata-visible: metadata-visible,
+                last-seen-visible: last-seen-visible,
+                profile-image-visible: profile-image-visible,
+                encryption-enabled: encryption-enabled,
                 last-updated: (unwrap-panic (get-block-info? time u0))
             }
         )
         
+        (update-rate-limit caller u2)
+        (update-user-activity caller)
+        
         (print {
             event: "privacy-updated",
             user: caller,
-            settings: {
-                friend-list-visible: friend-list-visible,
-                status-visible: status-visible,
-                metadata-visible: metadata-visible
-            }
+            timestamp: (unwrap-panic (get-block-info? time u0))
         })
         (ok true)
     )
 )
 
-(define-public (block-user (user principal))
+;; Enhanced user profile functions
+(define-public (update-user-profile
+    (name (optional (string-ascii 64)))
+    (metadata (optional (string-utf8 256)))
+    (encryption-key (optional (buff 32)))
+    (profile-image (optional (string-utf8 256))))
     (let
         (
             (caller tx-sender)
+            (user (unwrap-panic (map-get? Users caller)))
         )
-        (asserts! (not (is-eq caller user)) ERR_INVALID_INPUT)
         (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        (asserts! (check-rate-limit caller u2) ERR_RATE_LIMITED)
         
-        ;; Remove any existing friendship
-        (map-delete Friendships {user1: caller, user2: user})
-        (map-delete Friendships {user1: user, user2: caller})
-        
-        ;; Add to blocked users
-        (map-set BlockedUsers
-            {blocker: caller, blocked: user}
-            {
-                timestamp: (unwrap-panic (get-block-info? time u0)),
-                reason: none
-            }
+        (map-set Users caller
+            (merge user {
+                name: (default-to (get name user) name),
+                metadata: (if (is-some metadata) metadata (get metadata user)),
+                encryption-key: (if (is-some encryption-key) encryption-key (get encryption-key user)),
+                profile-image: (if (is-some profile-image) profile-image (get profile-image user))
+            })
         )
         
-        (print {event: "user-blocked", blocker: caller, blocked: user})
+        (update-rate-limit caller u2)
+        (update-user-activity caller)
+        
+        (print {
+            event: "profile-updated",
+            user: caller,
+            timestamp: (unwrap-panic (get-block-info? time u0))
+        })
         (ok true)
     )
 )
 
-(define-public (unblock-user (user principal))
+;; Batch management public functions
+(define-public (set-batch-size (new-size uint))
     (let
         (
             (caller tx-sender)
-            (block-data (map-get? BlockedUsers {blocker: caller, blocked: user}))
+            (batch-data (unwrap-panic (map-get? UserBatches caller)))
         )
-        (asserts! (is-some block-data) ERR_NOT_FOUND)
-        
-        (map-delete BlockedUsers {blocker: caller, blocked: user})
-        
-        (print {event: "user-unblocked", blocker: caller, blocked: user})
-        (ok true)
-    )
-)
-
-(define-public (cancel-friendship (friend principal))
-    (let
-        (
-            (caller tx-sender)
-        )
-        (asserts! (not (is-eq caller friend)) ERR_INVALID_INPUT)
         (asserts! (check-active-user caller) ERR_DEACTIVATED)
+        (asserts! (and (>= new-size MIN_BATCH_SIZE) (<= new-size MAX_BATCH_SIZE)) ERR_INVALID_INPUT)
         
-        ;; Remove friendship in both directions
-        (map-delete Friendships {user1: caller, user2: friend})
-        (map-delete Friendships {user1: friend, user2: caller})
+        (map-set UserBatches caller
+            (merge batch-data {
+                batch-size: new-size
+            })
+        )
         
-        (print {event: "friendship-cancelled", user1: caller, user2: friend})
+        (print {
+            event: "batch-size-updated",
+            user: caller,
+            new-size: new-size,
+            timestamp: (unwrap-panic (get-block-info? time u0))
+        })
         (ok true)
     )
 )
 
-;; Contract initialization
-(define-public (initialize-contract)
-    (ok true)
+;; Activity tracking
+(define-public (record-login)
+    (let
+        (
+            (caller tx-sender)
+            (activity (default-to
+                {
+                    last-seen: (unwrap-panic (get-block-info? time u0)),
+                    login-count: u0,
+                    total-actions: u0,
+                    last-action: (unwrap-panic (get-block-info? time u0))
+                }
+                (map-get? UserActivity caller)
+            ))
+        )
+        (map-set UserActivity caller
+            (merge activity {
+                last-seen: (unwrap-panic (get-block-info? time u0)),
+                login-count: (+ (get login-count activity) u1)
+            })
+        )
+        
+        (print {
+            event: "user-login",
+            user: caller,
+            timestamp: (unwrap-panic (get-block-info? time u0))
+        })
+        (ok true)
+    )
 )
