@@ -36,9 +36,6 @@
     }
 )
 
-;; SIP-009 NFT Interface (for potential future profile NFTs)
-(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
-
 ;; Read-only functions
 (define-read-only (get-user (user principal))
     (ok (map-get? Users user))
@@ -62,7 +59,8 @@
         (asserts! (is-none existing-user) ERR_ALREADY_EXISTS)
         (asserts! (> (len name) u0) ERR_INVALID_INPUT)
         
-        (try! (map-set Users 
+        ;; Direct map-set without try! since it doesn't return a response
+        (map-set Users 
             caller
             {
                 name: name,
@@ -70,17 +68,17 @@
                 timestamp: (unwrap-panic (get-block-info? time u0)),
                 metadata: metadata
             }
-        ))
+        )
         
         ;; Initialize batch tracking
-        (try! (map-set UserBatches
+        (map-set UserBatches
             caller
             {
                 message-counter: u0,
                 last-batch-timestamp: (unwrap-panic (get-block-info? time u0)),
                 batch-size: u50  ;; Default batch size
             }
-        ))
+        )
         
         (ok true)
     )
@@ -95,10 +93,10 @@
         (asserts! (is-some user) ERR_NOT_FOUND)
         (asserts! (<= new-status u2) ERR_INVALID_INPUT)
         
-        (try! (map-set Users 
+        (map-set Users 
             caller
             (merge (unwrap-panic user) {status: new-status})
-        ))
+        )
         
         (ok true)
     )
@@ -112,10 +110,10 @@
         )
         (asserts! (is-some user) ERR_NOT_FOUND)
         
-        (try! (map-set Users 
+        (map-set Users 
             caller
             (merge (unwrap-panic user) {metadata: (some new-metadata)})
-        ))
+        )
         
         (ok true)
     )
@@ -137,10 +135,10 @@
         (asserts! (is-none (map-get? Friendships {user1: caller, user2: friend})) ERR_ALREADY_EXISTS)
         (asserts! (is-none (map-get? Friendships {user1: friend, user2: caller})) ERR_ALREADY_EXISTS)
         
-        (try! (map-set Friendships 
+        (map-set Friendships 
             {user1: caller, user2: friend}
             friendship-data
-        ))
+        )
         
         (ok true)
     )
@@ -155,10 +153,10 @@
         (asserts! (is-some friendship) ERR_NOT_FOUND)
         (asserts! (is-eq (get status (unwrap-panic friendship)) u0) ERR_INVALID_INPUT)
         
-        (try! (map-set Friendships 
+        (map-set Friendships 
             {user1: friend, user2: caller}
             (merge (unwrap-panic friendship) {status: u1})
-        ))
+        )
         
         (ok true)
     )
