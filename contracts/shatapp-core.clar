@@ -91,6 +91,26 @@
     }
 )
 
+(define-map Friendships
+    {
+        user1: principal,
+        user2: principal
+    }
+    {
+        status: uint
+    }
+)
+
+(define-map BlockedUsers
+    {
+        blocker: principal,
+        blocked: principal
+    }
+    {
+        timestamp: uint
+    }
+)
+
 ;; Private functions
 (define-private (check-rate-limit (user principal) (action-type uint))
     (let
@@ -175,22 +195,80 @@
     )
 )
 
-;; Batch management functions
-(define-public (optimize-batch-size (user principal))
-    (let
-        (
-            (batch-data (unwrap-panic (map-get? UserBatches user)))
-            (current-time (unwrap-panic (get-block-info? time u0)))
-            (time-since-last-batch (- current-time (get last-batch-timestamp batch-data)))
-            (current-batch-size (get batch-size batch-data))
-            (items-in-current-batch (get current-batch-items batch-data))
+(define-private (max-uint (a uint) (b uint))
+    (if (>= a b)
+        a
+        b
+    )
+)
+
+(define-private (min-uint (a uint) (b uint))
+    (if (<= a b)
+        a
+        b
+    )
+)
+
+;; Check if users are friends
+(define-private (are-friends (user1 principal) (user2 principal))
+    (match (map-get? Friendships {user1: user1, user2: user2})
+        friendship (is-eq (get status friendship) FRIENDSHIP_ACTIVE)
+        false
+    )
+)
+
+;; Check if user is active
+(define-private (check-active-user (user principal))
+    (match (map-get? Users user)
+        user-data (and 
+            (is-eq (get status user-data) STATUS_ACTIVE)
+            (is-none (get deactivation-time user-data))
         )
+        false
+    )
+)
+
+;; Check if user exists
+(define-private (user-exists (user principal))
+    (is-some (map-get? Users user))
+)
+
+;; Check if user is blocked
+(define-private (is-blocked (blocker principal) (blocked principal))
+    (is-some (map-get? BlockedUsers {blocker: blocker, blocked: blocked}))
+)
+
+;; Get user privacy settings with defaults
+(define-private (get-privacy-settings (user principal))
+    (default-to
+        {
+            friend-list-visible: true,
+            status-visible: true,
+            metadata-visible: true,
+            last-seen-visible: true,
+            profile-image-visible: true,
+            encryption-enabled: false,
+            last-updated: (unwrap-panic (get-block-info? time u0))
+        }
+        (map-get? UserPrivacy user)
+    )
+)
+
+;; Modified optimize-batch-size function
+(define-public (optimize-batch-size (user principal))
+    (let (
+        (batch-data (unwrap-panic (map-get? UserBatches user)))
+        (current-time (unwrap-panic (get-block-info? time u0)))
+        (time-since-last-batch (- current-time (get last-batch-timestamp batch-data)))
+        (current-batch-size (get batch-size batch-data))
+        (items-in-current-batch (get current-batch-items batch-data))
+    )
         (if (> time-since-last-batch BATCH_EXPIRY_PERIOD)
             ;; Batch expired, reset and adjust size
             (begin
                 (map-set UserBatches user
                     (merge batch-data {
-                        batch-size: (max MIN_BATCH_SIZE (/ current-batch-size u2)),
+                        batch-size: (max-uint MIN_BATCH_SIZE (/ current-batch-size u2)),
                         current-batch-items: u0,
                         last-batch-timestamp: current-time
                     })
@@ -201,7 +279,7 @@
             (begin
                 (map-set UserBatches user
                     (merge batch-data {
-                        batch-size: (min MAX_BATCH_SIZE 
+                        batch-size: (min-uint MAX_BATCH_SIZE 
                             (if (>= items-in-current-batch (/ current-batch-size u2))
                                 (* current-batch-size u2)
                                 current-batch-size
